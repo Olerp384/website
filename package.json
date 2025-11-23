@@ -1,0 +1,17 @@
+{
+  "name": "container-id-website",
+  "version": "1.0.0",
+  "description": "Tiny site that shows its container ID on the home page.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "container",
+    "hostname",
+    "docker",
+    "node"
+  ],
+  "author": "",
+  "license": "MIT"
+}

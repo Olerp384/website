@@ -14,6 +14,15 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 const loginStatus = el('loginStatus');
+const fmtProgress = (job) => {
+  if (!job) return '';
+  const { progress_bytes = 0, total_bytes = null } = job;
+  if (total_bytes) {
+    const pct = Math.min(100, Math.round((progress_bytes / total_bytes) * 100));
+    return { pct, text: `${pct}% (${progress_bytes}/${total_bytes} байт)` };
+  }
+  return { pct: null, text: `${progress_bytes} байт` };
+};
 
 const api = async (path, options = {}) => {
   const headers = options.headers || {};
@@ -352,13 +361,17 @@ const renderDocumentsTab = (container) => {
       jobs.forEach((job) => {
         const row = document.createElement('div');
         row.className = 'card';
-        const progress = job.total_bytes ? `${job.progress_bytes || 0}/${job.total_bytes} байт` : `${job.progress_bytes || 0} байт`;
+        const prog = fmtProgress(job);
         row.innerHTML = `
           <div style="display:flex;justify-content:space-between;">
             <div><strong>${job.title || job.file_name || 'Документ'}</strong><div class="muted">${job.url}</div></div>
             <div class="muted">${job.status}${job.error ? `: ${job.error}` : ''}</div>
           </div>
-          <div class="muted">Прогресс: ${progress}</div>
+          <div class="muted">Прогресс: ${prog.text}</div>
+          ${prog.pct !== null ? `
+            <div style="background: rgba(255,255,255,0.07); border-radius: 6px; overflow: hidden; height: 8px; margin-top:4px;">
+              <div style="height:8px;width:${prog.pct}%;background: linear-gradient(90deg,#7dd3fc,#a78bfa);"></div>
+            </div>` : ''}
         `;
         if (job.status === 'queued' || job.status === 'running') {
           const cancel = document.createElement('button');
@@ -623,7 +636,7 @@ const renderDistributionsTab = (container) => {
         const dlBox = document.createElement('div');
         dlBox.className = 'stack';
         jobs.forEach((job) => {
-          const progress = job.total_bytes ? `${job.progress_bytes || 0}/${job.total_bytes} байт` : `${job.progress_bytes || 0} байт`;
+          const prog = fmtProgress(job);
           const row = document.createElement('div');
           row.className = 'card';
           row.innerHTML = `
@@ -631,7 +644,11 @@ const renderDistributionsTab = (container) => {
               <div><strong>${job.file_name || job.url}</strong><div class="muted">${job.url}</div></div>
               <div class="muted">${job.status}${job.error ? `: ${job.error}` : ''}</div>
             </div>
-            <div class="muted">Прогресс: ${progress}</div>
+            <div class="muted">Прогресс: ${prog.text}</div>
+            ${prog.pct !== null ? `
+              <div style="background: rgba(255,255,255,0.07); border-radius: 6px; overflow: hidden; height: 8px; margin-top:4px;">
+                <div style="height:8px;width:${prog.pct}%;background: linear-gradient(90deg,#7dd3fc,#a78bfa);"></div>
+              </div>` : ''}
           `;
           if (job.status === 'queued' || job.status === 'running') {
             const cancel = document.createElement('button');

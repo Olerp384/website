@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Каталог стендов</title>
+  <style>
+    :root {
+      --bg: #0b1021;
+      --panel: #11182f;
+      --card: #151e38;
+      --accent: #7dd3fc;
+      --accent-2: #a78bfa;
+      --muted: #93a4c3;
+      --text: #e5e7f0;
+      --danger: #f87171;
+      --border: rgba(255, 255, 255, 0.08);
+      font-family: "Space Grotesk", "Segoe UI", "Inter", system-ui, sans-serif;
+      color-scheme: dark;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 20% 30%, rgba(167, 139, 250, 0.08), transparent 35%),
+                  radial-gradient(circle at 80% 20%, rgba(125, 211, 252, 0.08), transparent 30%),
+                  linear-gradient(140deg, #0b1021, #0e1427);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      background: rgba(17, 24, 47, 0.8);
+      backdrop-filter: blur(8px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1 { margin: 0; font-size: 20px; letter-spacing: 0.02em; }
+    .pill {
+      border: 1px solid var(--border);
+      background: var(--card);
+      border-radius: 10px;
+      padding: 10px 12px;
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+    input, select, button, textarea {
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #0e162c;
+      color: var(--text);
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+    button {
+      background: linear-gradient(135deg, var(--accent), var(--accent-2));
+      border: none;
+      color: #0b1021;
+      font-weight: 600;
+      cursor: pointer;
+      transition: transform 120ms ease, filter 120ms ease;
+    }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+    button:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.05); }
+    main { padding: 24px; display: grid; grid-template-columns: 360px 1fr; gap: 18px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+    }
+    .stack { display: flex; flex-direction: column; gap: 12px; }
+    .list { display: flex; flex-direction: column; gap: 10px; max-height: 70vh; overflow: auto; padding-right: 6px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 12px 14px;
+      display: grid;
+      gap: 6px;
+    }
+    .tags { display: flex; gap: 6px; flex-wrap: wrap; }
+    .tag { padding: 4px 8px; border-radius: 999px; background: rgba(125, 211, 252, 0.15); color: var(--accent); font-size: 12px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .grid { display: grid; gap: 10px; }
+    .two { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+    .tab-bar { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+    .tab { padding: 8px 10px; border: 1px solid var(--border); background: var(--card); border-radius: 8px; cursor: pointer; }
+    .tab.active { border-color: var(--accent); color: var(--accent); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid var(--border); text-align: left; }
+    .danger { background: var(--danger); color: #0b1021; }
+    .form-row { display: flex; gap: 10px; flex-wrap: wrap; }
+    @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Каталог стендов</h1>
+    <div class="pill" id="loginBox">
+      <input id="loginUser" placeholder="Логин" />
+      <input id="loginPass" type="password" placeholder="Пароль" />
+      <button id="loginBtn">Войти</button>
+      <button id="logoutBtn" style="display:none;">Выйти</button>
+      <span id="loginStatus" class="muted"></span>
+    </div>
+    <div class="pill" style="margin-left:auto;">
+      <input id="searchInput" placeholder="Поиск стендов" />
+      <button id="searchBtn">Искать</button>
+    </div>
+  </header>
+  <main>
+    <section class="panel stack">
+      <div class="grid two">
+        <input id="filterStatus" placeholder="Статус (active/draft)" />
+        <input id="filterTag" placeholder="Тег" />
+      </div>
+      <div class="form-row">
+        <input id="newStandName" placeholder="Новый стенд: название" />
+        <button id="createStandBtn">Добавить стенд</button>
+      </div>
+      <div class="list" id="standList"></div>
+    </section>
+    <section class="panel stack" id="detailPanel">
+      <div id="standHeader" class="stack">
+        <div class="muted">Выберите стенд слева, чтобы увидеть детали</div>
+      </div>
+      <div class="tab-bar" id="tabs"></div>
+      <div id="tabContent"></div>
+    </section>
+  </main>
+  <script>
+    window.APP_CONFIG = { apiBase: '/api/v1' };
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>

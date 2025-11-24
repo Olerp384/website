@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  stand-catalog:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      JWT_SECRET: change_me
+      ADMIN_USERNAME: admin
+      ADMIN_PASSWORD: admin
+      DATABASE_PATH: /app/data/app.db
+      STORAGE_ROOT: /app/storage/documents
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./logs:/app/logs

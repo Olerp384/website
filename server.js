@@ -33,6 +33,31 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
+const makeStoredName = (original) => {
+  const ext = path.extname(original || '') || '';
+  const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+  return `${unique}${ext}`;
+};
+
+const fetchRemoteFile = async (url) => {
+  const maxSize = 50 * 1024 * 1024;
+  const response = await fetch(url);
+  if (!response.ok) throw new Error('Не удалось скачать файл по ссылке');
+  const contentLength = response.headers.get('content-length');
+  if (contentLength && Number(contentLength) > maxSize) throw new Error('Файл слишком большой');
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length > maxSize) throw new Error('Файл слишком большой');
+  const contentType = response.headers.get('content-type') || 'application/octet-stream';
+  let originalName = 'download.bin';
+  try {
+    const parsed = new URL(url);
+    const base = path.basename(parsed.pathname);
+    if (base) originalName = decodeURIComponent(base);
+  } catch (_e) { /* ignore */ }
+  return { buffer, contentType, originalName };
+};
+
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
@@ -305,30 +330,51 @@ app.get('/api/v1/stands/:stand_id/documents', (req, res) => {
   res.json(buildListResponse(items, total, page, page_size));
 });
 
-app.post('/api/v1/stands/:stand_id/documents', requireAdmin, upload.single('file'), (req, res) => {
-  const { stand_id } = req.params;
-  const stand = db.prepare('SELECT * FROM stands WHERE id = ?').get(stand_id);
-  if (!stand) return sendError(res, 'not_found', 'Stand not found', 404);
-  const file = req.file;
-  if (!file) return sendError(res, 'invalid_request', 'File is required', 400);
-  const { title = file.originalname, description = '', editable_inline = false, created_by = req.user.username || '' } = req.body || {};
-  const isInline = editable_inline === 'true' || editable_inline === true || editable_inline === '1';
-  const result = db.prepare(
-    'INSERT INTO documents (stand_id, title, description, file_name, stored_name, mime_type, editable_inline, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-  ).run(
-    stand_id,
-    title,
-    description,
-    file.originalname,
-    file.filename,
-    file.mimetype,
-    isInline ? 1 : 0,
-    new Date().toISOString(),
-    created_by,
-  );
-  const created = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
-  logAdminAction(req.user.username, 'upload_document', { document_id: created.id, stand_id });
-  res.status(201).json(created);
+app.post('/api/v1/stands/:stand_id/documents', requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    const { stand_id } = req.params;
+    const stand = db.prepare('SELECT * FROM stands WHERE id = ?').get(stand_id);
+    if (!stand) return sendError(res, 'not_found', 'Stand not found', 404);
+    const file = req.file;
+    const url = req.body?.url;
+    let storedName;
+    let fileName;
+    let mimeType;
+    if (file) {
+      storedName = file.filename;
+      fileName = file.originalname;
+      mimeType = file.mimetype;
+    } else if (url) {
+      try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
+      const remote = await fetchRemoteFile(url);
+      storedName = makeStoredName(remote.originalName);
+      fileName = remote.originalName;
+      mimeType = remote.contentType;
+      fs.writeFileSync(path.join(storageRoot, storedName), remote.buffer);
+    } else {
+      return sendError(res, 'invalid_request', 'File or url is required', 400);
+    }
+    const { title = fileName, description = '', editable_inline = false, created_by = req.user.username || '' } = req.body || {};
+    const isInline = editable_inline === 'true' || editable_inline === true || editable_inline === '1';
+    const result = db.prepare(
+      'INSERT INTO documents (stand_id, title, description, file_name, stored_name, mime_type, editable_inline, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(
+      stand_id,
+      title || fileName,
+      description,
+      fileName,
+      storedName,
+      mimeType || 'application/octet-stream',
+      isInline ? 1 : 0,
+      new Date().toISOString(),
+      created_by,
+    );
+    const created = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
+    logAdminAction(req.user.username, 'upload_document', { document_id: created.id, stand_id });
+    res.status(201).json(created);
+  } catch (err) {
+    return sendError(res, 'invalid_request', err.message);
+  }
 });
 
 app.get('/api/v1/documents/:id', (req, res) => {
@@ -518,23 +564,41 @@ app.get('/api/v1/distributions/:id/versions', (req, res) => {
   res.json(buildListResponse(items, total, page, page_size));
 });
 
-app.post('/api/v1/distributions/:id/versions', requireAdmin, upload.single('file'), (req, res) => {
-  const { id } = req.params;
-  const product = db.prepare('SELECT * FROM distribution_products WHERE id = ?').get(id);
-  if (!product) return sendError(res, 'not_found', 'Distribution not found', 404);
-  const file = req.file;
-  if (!file) return sendError(res, 'invalid_request', 'File is required', 400);
-  const { description = '', is_active = false } = req.body || {};
-  const active = is_active === 'true' || is_active === true || is_active === '1';
-  const result = db.prepare(
-    'INSERT INTO distribution_versions (product_id, file_name, file_path, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(id, file.originalname, file.filename, description, active ? 1 : 0, new Date().toISOString());
-  const created = db.prepare('SELECT * FROM distribution_versions WHERE id = ?').get(result.lastInsertRowid);
-  if (active) {
-    db.prepare('UPDATE distribution_versions SET is_active = 0 WHERE product_id = ? AND id != ?').run(id, created.id);
+app.post('/api/v1/distributions/:id/versions', requireAdmin, upload.single('file'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const product = db.prepare('SELECT * FROM distribution_products WHERE id = ?').get(id);
+    if (!product) return sendError(res, 'not_found', 'Distribution not found', 404);
+    const file = req.file;
+    const url = req.body?.url;
+    let storedName;
+    let fileName;
+    if (file) {
+      storedName = file.filename;
+      fileName = file.originalname;
+    } else if (url) {
+      try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
+      const remote = await fetchRemoteFile(url);
+      storedName = makeStoredName(remote.originalName);
+      fileName = remote.originalName;
+      fs.writeFileSync(path.join(storageRoot, storedName), remote.buffer);
+    } else {
+      return sendError(res, 'invalid_request', 'File or url is required', 400);
+    }
+    const { description = '', is_active = false } = req.body || {};
+    const active = is_active === 'true' || is_active === true || is_active === '1';
+    const result = db.prepare(
+      'INSERT INTO distribution_versions (product_id, file_name, file_path, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(id, fileName, storedName, description, active ? 1 : 0, new Date().toISOString());
+    const created = db.prepare('SELECT * FROM distribution_versions WHERE id = ?').get(result.lastInsertRowid);
+    if (active) {
+      db.prepare('UPDATE distribution_versions SET is_active = 0 WHERE product_id = ? AND id != ?').run(id, created.id);
+    }
+    logAdminAction(req.user.username, 'upload_distribution_version', { version_id: created.id, product_id: id });
+    res.status(201).json(created);
+  } catch (err) {
+    return sendError(res, 'invalid_request', err.message);
   }
-  logAdminAction(req.user.username, 'upload_distribution_version', { version_id: created.id, product_id: id });
-  res.status(201).json(created);
 });
 
 app.get('/api/v1/distribution-versions/:id', (req, res) => {

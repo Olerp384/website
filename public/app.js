@@ -9,6 +9,7 @@ const state = {
   vms: [],
   distributions: [],
   graph: { nodes: [], edges: [] },
+  downloads: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -151,7 +152,7 @@ const selectStand = async (id) => {
       } catch (err) { alert(err.message); }
     };
   }
-  await Promise.all([loadDocuments(id), loadServers(id), loadVms(id), loadDistributions(id), loadGraph(id)]);
+  await Promise.all([loadDocuments(id), loadServers(id), loadVms(id), loadDistributions(id), loadGraph(id), loadDownloads(id)]);
   renderTabs('info');
 };
 
@@ -182,6 +183,15 @@ const loadDistributions = async (standId) => {
 
 const loadGraph = async (standId) => {
   state.graph = await api(`/stands/${standId}/graph`);
+};
+
+const loadDownloads = async (standId) => {
+  if (!token) {
+    state.downloads = [];
+    return;
+  }
+  const data = await api(`/downloads?stand_id=${standId}`);
+  state.downloads = data.items || [];
 };
 
 const renderTabs = (active) => {
@@ -324,6 +334,49 @@ const renderDocumentsTab = (container) => {
     };
     wrap.appendChild(linkForm);
   }
+
+  if (token) {
+    const downloadsBlock = document.createElement('div');
+    downloadsBlock.className = 'stack';
+    const refreshBtn = document.createElement('button');
+    refreshBtn.textContent = 'Обновить загрузки';
+    refreshBtn.onclick = async () => { await loadDownloads(state.selectedStand.id); renderTabs('documents'); };
+    downloadsBlock.appendChild(refreshBtn);
+    const jobs = state.downloads.filter((j) => j.kind === 'document');
+    if (jobs.length === 0) {
+      const text = document.createElement('div');
+      text.className = 'muted';
+      text.textContent = 'Нет фоновых загрузок';
+      downloadsBlock.appendChild(text);
+    } else {
+      jobs.forEach((job) => {
+        const row = document.createElement('div');
+        row.className = 'card';
+        const progress = job.total_bytes ? `${job.progress_bytes || 0}/${job.total_bytes} байт` : `${job.progress_bytes || 0} байт`;
+        row.innerHTML = `
+          <div style="display:flex;justify-content:space-between;">
+            <div><strong>${job.title || job.file_name || 'Документ'}</strong><div class="muted">${job.url}</div></div>
+            <div class="muted">${job.status}${job.error ? `: ${job.error}` : ''}</div>
+          </div>
+          <div class="muted">Прогресс: ${progress}</div>
+        `;
+        if (job.status === 'queued' || job.status === 'running') {
+          const cancel = document.createElement('button');
+          cancel.className = 'danger';
+          cancel.textContent = 'Отменить';
+          cancel.onclick = async () => {
+            await api(`/downloads/${job.id}/cancel`, { method: 'POST' });
+            await loadDownloads(state.selectedStand.id);
+            renderTabs('documents');
+          };
+          row.appendChild(cancel);
+        }
+        downloadsBlock.appendChild(row);
+      });
+    }
+    wrap.appendChild(downloadsBlock);
+  }
+
   const list = document.createElement('div');
   list.className = 'list';
   if (state.documents.length === 0) list.innerHTML = '<div class="muted">Нет документов</div>';
@@ -491,6 +544,11 @@ const renderDistributionsTab = (container) => {
   const wrap = document.createElement('div');
   wrap.className = 'stack';
   if (token) {
+    const refresh = document.createElement('button');
+    refresh.textContent = 'Обновить загрузки';
+    refresh.onclick = async () => { await loadDownloads(state.selectedStand.id); renderTabs('distributions'); };
+    wrap.appendChild(refresh);
+
     const form = document.createElement('div');
     form.className = 'form-row';
     form.innerHTML = `
@@ -558,6 +616,38 @@ const renderDistributionsTab = (container) => {
         } catch (err) { alert(err.message); }
       };
       card.appendChild(upload);
+    }
+    if (token) {
+      const jobs = state.downloads.filter((j) => j.kind === 'distribution_version' && j.product_id === d.id);
+      if (jobs.length) {
+        const dlBox = document.createElement('div');
+        dlBox.className = 'stack';
+        jobs.forEach((job) => {
+          const progress = job.total_bytes ? `${job.progress_bytes || 0}/${job.total_bytes} байт` : `${job.progress_bytes || 0} байт`;
+          const row = document.createElement('div');
+          row.className = 'card';
+          row.innerHTML = `
+            <div style="display:flex;justify-content:space-between;">
+              <div><strong>${job.file_name || job.url}</strong><div class="muted">${job.url}</div></div>
+              <div class="muted">${job.status}${job.error ? `: ${job.error}` : ''}</div>
+            </div>
+            <div class="muted">Прогресс: ${progress}</div>
+          `;
+          if (job.status === 'queued' || job.status === 'running') {
+            const cancel = document.createElement('button');
+            cancel.className = 'danger';
+            cancel.textContent = 'Отменить';
+            cancel.onclick = async () => {
+              await api(`/downloads/${job.id}/cancel`, { method: 'POST' });
+              await loadDownloads(state.selectedStand.id);
+              renderTabs('distributions');
+            };
+            row.appendChild(cancel);
+          }
+          dlBox.appendChild(row);
+        });
+        card.appendChild(dlBox);
+      }
     }
     const versions = document.createElement('div');
     versions.className = 'stack';

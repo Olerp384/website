@@ -7,6 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const Database = require('better-sqlite3');
+const { Readable } = require('stream');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -39,23 +40,14 @@ const makeStoredName = (original) => {
   return `${unique}${ext}`;
 };
 
-const fetchRemoteFile = async (url) => {
-  const maxSize = 50 * 1024 * 1024;
-  const response = await fetch(url);
-  if (!response.ok) throw new Error('Failed to download file from URL');
-  const contentLength = response.headers.get('content-length');
-  if (contentLength && Number(contentLength) > maxSize) throw new Error('Remote file too large');
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  if (buffer.length > maxSize) throw new Error('Remote file too large');
-  const contentType = response.headers.get('content-type') || 'application/octet-stream';
-  let originalName = 'download.bin';
+const extractNameFromUrl = (url) => {
   try {
     const parsed = new URL(url);
     const base = path.basename(parsed.pathname);
-    if (base) originalName = decodeURIComponent(base);
-  } catch (_e) { /* ignore */ }
-  return { buffer, contentType, originalName };
+    return base ? decodeURIComponent(base) : 'download.bin';
+  } catch (_e) {
+    return 'download.bin';
+  }
 };
 
 app.use(cors());
@@ -201,6 +193,29 @@ const runMigrations = () => {
       FOREIGN KEY (source_node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE,
       FOREIGN KEY (target_node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE
     );
+    CREATE TABLE IF NOT EXISTS download_jobs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL, -- document | distribution_version
+      stand_id INTEGER,
+      product_id INTEGER,
+      title TEXT,
+      description TEXT,
+      editable_inline INTEGER DEFAULT 0,
+      is_active INTEGER DEFAULT 0,
+      url TEXT NOT NULL,
+      status TEXT DEFAULT 'queued',
+      progress_bytes INTEGER DEFAULT 0,
+      total_bytes INTEGER,
+      stored_name TEXT,
+      file_name TEXT,
+      mime_type TEXT,
+      error TEXT,
+      created_by TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (stand_id) REFERENCES stands(id) ON DELETE CASCADE,
+      FOREIGN KEY (product_id) REFERENCES distribution_products(id) ON DELETE CASCADE
+    );
   `);
 };
 
@@ -234,6 +249,153 @@ const requireAdmin = (req, res, next) => {
 };
 
 const buildListResponse = (items, total, page, page_size) => ({ items, page, page_size, total });
+
+// ---- Download worker (persistent queue) ----
+const abortControllers = new Map(); // jobId -> { controller, filePath }
+
+const markStaleRunningAsQueued = () => {
+  db.prepare("UPDATE download_jobs SET status = 'queued', updated_at = ? WHERE status = 'running'").run(new Date().toISOString());
+};
+
+const getNextJob = () => db.prepare("SELECT * FROM download_jobs WHERE status IN ('queued','running') ORDER BY created_at LIMIT 1").get();
+
+const updateJob = (id, data) => {
+  const fields = Object.keys(data);
+  const placeholders = fields.map((f) => `${f} = ?`).join(', ');
+  const values = fields.map((f) => data[f]);
+  db.prepare(`UPDATE download_jobs SET ${placeholders} WHERE id = ?`).run(...values, id);
+};
+
+const createDocumentFromJob = (job) => {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    'INSERT INTO documents (stand_id, title, description, file_name, stored_name, mime_type, editable_inline, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+  ).run(
+    job.stand_id,
+    job.title || job.file_name,
+    job.description || '',
+    job.file_name,
+    job.stored_name,
+    job.mime_type || 'application/octet-stream',
+    job.editable_inline ? 1 : 0,
+    now,
+    job.created_by || '',
+  );
+  return db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
+};
+
+const createDistributionVersionFromJob = (job) => {
+  const now = new Date().toISOString();
+  const result = db.prepare(
+    'INSERT INTO distribution_versions (product_id, file_name, file_path, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(job.product_id, job.file_name, job.stored_name, job.description || '', job.is_active ? 1 : 0, now);
+  const created = db.prepare('SELECT * FROM distribution_versions WHERE id = ?').get(result.lastInsertRowid);
+  if (job.is_active) {
+    db.prepare('UPDATE distribution_versions SET is_active = 0 WHERE product_id = ? AND id != ?').run(job.product_id, created.id);
+  }
+  return created;
+};
+
+const downloadAndStore = async (job) => {
+  const controller = new AbortController();
+  abortControllers.set(job.id, { controller });
+  const now = new Date().toISOString();
+  updateJob(job.id, { status: 'running', updated_at: now });
+
+  const response = await fetch(job.url, { signal: controller.signal });
+  if (!response.ok) throw new Error(`Remote responded with ${response.status}`);
+  const total = Number(response.headers.get('content-length')) || null;
+  if (total) updateJob(job.id, { total_bytes: total, updated_at: new Date().toISOString() });
+
+  const originalName = job.file_name || extractNameFromUrl(job.url);
+  const storedName = makeStoredName(originalName);
+  const destPath = path.join(storageRoot, storedName);
+  abortControllers.get(job.id).filePath = destPath;
+
+  const nodeStream = Readable.fromWeb(response.body);
+  const fileStream = fs.createWriteStream(destPath);
+  let downloaded = 0;
+
+  await new Promise((resolve, reject) => {
+    nodeStream.on('data', (chunk) => {
+      downloaded += chunk.length;
+      updateJob(job.id, { progress_bytes: downloaded, updated_at: new Date().toISOString() });
+    });
+    nodeStream.on('error', reject);
+    fileStream.on('error', reject);
+    fileStream.on('finish', resolve);
+    nodeStream.pipe(fileStream);
+  });
+
+  const mime = response.headers.get('content-type') || 'application/octet-stream';
+  updateJob(job.id, {
+    status: 'completed',
+    stored_name: storedName,
+    file_name: originalName,
+    mime_type: mime,
+    updated_at: new Date().toISOString(),
+  });
+
+  let createdRecord = null;
+  if (job.kind === 'document') {
+    createdRecord = createDocumentFromJob({
+      ...job,
+      stored_name: storedName,
+      file_name: originalName,
+      mime_type: mime,
+    });
+  } else if (job.kind === 'distribution_version') {
+    createdRecord = createDistributionVersionFromJob({
+      ...job,
+      stored_name: storedName,
+      file_name: originalName,
+      mime_type: mime,
+    });
+  }
+  abortControllers.delete(job.id);
+  return createdRecord;
+};
+
+let workerActive = false;
+const processQueue = async () => {
+  if (workerActive) return;
+  workerActive = true;
+  try {
+    while (true) {
+      const job = getNextJob();
+      if (!job) break;
+      if (job.status === 'queued') updateJob(job.id, { status: 'running', updated_at: new Date().toISOString() });
+      try {
+        await downloadAndStore(job);
+      } catch (err) {
+        const current = db.prepare('SELECT status FROM download_jobs WHERE id = ?').get(job.id);
+        if (current && current.status === 'cancelled') {
+          // Already cancelled; clean up.
+        } else {
+          const meta = { status: 'failed', error: err.message, updated_at: new Date().toISOString() };
+          updateJob(job.id, meta);
+        }
+        const entry = abortControllers.get(job.id);
+        if (entry && entry.filePath && fs.existsSync(entry.filePath)) fs.unlinkSync(entry.filePath);
+        abortControllers.delete(job.id);
+      }
+    }
+  } finally {
+    workerActive = false;
+  }
+};
+
+const cancelJob = (jobId) => {
+  const running = abortControllers.get(jobId);
+  if (running) {
+    running.controller.abort();
+    if (running.filePath && fs.existsSync(running.filePath)) fs.unlinkSync(running.filePath);
+  }
+  updateJob(jobId, { status: 'cancelled', updated_at: new Date().toISOString() });
+};
+
+markStaleRunningAsQueued();
+processQueue();
 
 // Auth
 app.post('/api/v1/auth/login', (req, res) => {
@@ -337,41 +499,47 @@ app.post('/api/v1/stands/:stand_id/documents', requireAdmin, upload.single('file
     if (!stand) return sendError(res, 'not_found', 'Stand not found', 404);
     const file = req.file;
     const url = req.body?.url;
-    let storedName;
-    let fileName;
-    let mimeType;
-    if (file) {
-      storedName = file.filename;
-      fileName = file.originalname;
-      mimeType = file.mimetype;
-    } else if (url) {
-      try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
-      const remote = await fetchRemoteFile(url);
-      storedName = makeStoredName(remote.originalName);
-      fileName = remote.originalName;
-      mimeType = remote.contentType;
-      fs.writeFileSync(path.join(storageRoot, storedName), remote.buffer);
-    } else {
-      return sendError(res, 'invalid_request', 'File or url is required', 400);
-    }
-    const { title = fileName, description = '', editable_inline = false, created_by = req.user.username || '' } = req.body || {};
+    const { title, description = '', editable_inline = false, created_by = req.user.username || '' } = req.body || {};
     const isInline = editable_inline === 'true' || editable_inline === true || editable_inline === '1';
-    const result = db.prepare(
-      'INSERT INTO documents (stand_id, title, description, file_name, stored_name, mime_type, editable_inline, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+
+    if (file) {
+      const storedName = file.filename;
+      const fileName = file.originalname;
+      const result = db.prepare(
+        'INSERT INTO documents (stand_id, title, description, file_name, stored_name, mime_type, editable_inline, created_at, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      ).run(
+        stand_id,
+        title || fileName,
+        description,
+        fileName,
+        storedName,
+        file.mimetype,
+        isInline ? 1 : 0,
+        new Date().toISOString(),
+        created_by,
+      );
+      const created = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
+      logAdminAction(req.user.username, 'upload_document', { document_id: created.id, stand_id });
+      return res.status(201).json(created);
+    }
+
+    if (!url) return sendError(res, 'invalid_request', 'File or url is required', 400);
+    try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
+    const job = db.prepare(
+      `INSERT INTO download_jobs (kind, stand_id, title, description, editable_inline, url, status, created_by, updated_at)
+       VALUES ('document', ?, ?, ?, ?, ?, 'queued', ?, ?)`,
     ).run(
       stand_id,
-      title || fileName,
+      title || null,
       description,
-      fileName,
-      storedName,
-      mimeType || 'application/octet-stream',
       isInline ? 1 : 0,
-      new Date().toISOString(),
+      url,
       created_by,
+      new Date().toISOString(),
     );
-    const created = db.prepare('SELECT * FROM documents WHERE id = ?').get(result.lastInsertRowid);
-    logAdminAction(req.user.username, 'upload_document', { document_id: created.id, stand_id });
-    res.status(201).json(created);
+    logAdminAction(req.user.username, 'queue_document_download', { job_id: job.lastInsertRowid, stand_id });
+    processQueue();
+    return res.status(202).json({ job_id: job.lastInsertRowid, status: 'queued' });
   } catch (err) {
     return sendError(res, 'invalid_request', err.message);
   }
@@ -571,31 +739,40 @@ app.post('/api/v1/distributions/:id/versions', requireAdmin, upload.single('file
     if (!product) return sendError(res, 'not_found', 'Distribution not found', 404);
     const file = req.file;
     const url = req.body?.url;
-    let storedName;
-    let fileName;
-    if (file) {
-      storedName = file.filename;
-      fileName = file.originalname;
-    } else if (url) {
-      try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
-      const remote = await fetchRemoteFile(url);
-      storedName = makeStoredName(remote.originalName);
-      fileName = remote.originalName;
-      fs.writeFileSync(path.join(storageRoot, storedName), remote.buffer);
-    } else {
-      return sendError(res, 'invalid_request', 'File or url is required', 400);
-    }
     const { description = '', is_active = false } = req.body || {};
     const active = is_active === 'true' || is_active === true || is_active === '1';
-    const result = db.prepare(
-      'INSERT INTO distribution_versions (product_id, file_name, file_path, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?)',
-    ).run(id, fileName, storedName, description, active ? 1 : 0, new Date().toISOString());
-    const created = db.prepare('SELECT * FROM distribution_versions WHERE id = ?').get(result.lastInsertRowid);
-    if (active) {
-      db.prepare('UPDATE distribution_versions SET is_active = 0 WHERE product_id = ? AND id != ?').run(id, created.id);
+
+    if (file) {
+      const storedName = file.filename;
+      const fileName = file.originalname;
+      const result = db.prepare(
+        'INSERT INTO distribution_versions (product_id, file_name, file_path, description, is_active, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      ).run(id, fileName, storedName, description, active ? 1 : 0, new Date().toISOString());
+      const created = db.prepare('SELECT * FROM distribution_versions WHERE id = ?').get(result.lastInsertRowid);
+      if (active) {
+        db.prepare('UPDATE distribution_versions SET is_active = 0 WHERE product_id = ? AND id != ?').run(id, created.id);
+      }
+      logAdminAction(req.user.username, 'upload_distribution_version', { version_id: created.id, product_id: id });
+      return res.status(201).json(created);
     }
-    logAdminAction(req.user.username, 'upload_distribution_version', { version_id: created.id, product_id: id });
-    res.status(201).json(created);
+
+    if (!url) return sendError(res, 'invalid_request', 'File or url is required', 400);
+    try { new URL(url); } catch (_e) { return sendError(res, 'invalid_request', 'Invalid URL', 400); }
+    const job = db.prepare(
+      `INSERT INTO download_jobs (kind, stand_id, product_id, description, is_active, url, status, created_by, updated_at)
+       VALUES ('distribution_version', ?, ?, ?, ?, ?, 'queued', ?, ?)`,
+    ).run(
+      product.stand_id,
+      id,
+      description,
+      active ? 1 : 0,
+      url,
+      req.user.username || '',
+      new Date().toISOString(),
+    );
+    logAdminAction(req.user.username, 'queue_distribution_download', { job_id: job.lastInsertRowid, product_id: id });
+    processQueue();
+    return res.status(202).json({ job_id: job.lastInsertRowid, status: 'queued' });
   } catch (err) {
     return sendError(res, 'invalid_request', err.message);
   }
@@ -637,6 +814,34 @@ app.get('/api/v1/distribution-versions/:id/download', (req, res) => {
   const filePath = path.join(storageRoot, version.file_path);
   if (!fs.existsSync(filePath)) return sendError(res, 'not_found', 'File missing on server', 404);
   res.download(filePath, version.file_name);
+});
+
+// Download jobs
+app.get('/api/v1/downloads', requireAdmin, (req, res) => {
+  const { stand_id, kind } = req.query;
+  const conditions = [];
+  const params = [];
+  if (stand_id) { conditions.push('stand_id = ?'); params.push(stand_id); }
+  if (kind) { conditions.push('kind = ?'); params.push(kind); }
+  const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+  const jobs = db.prepare(`SELECT * FROM download_jobs ${where} ORDER BY created_at DESC LIMIT 200`).all(...params);
+  res.json({ items: jobs });
+});
+
+app.get('/api/v1/downloads/:id', requireAdmin, (req, res) => {
+  const job = db.prepare('SELECT * FROM download_jobs WHERE id = ?').get(req.params.id);
+  if (!job) return sendError(res, 'not_found', 'Job not found', 404);
+  res.json(job);
+});
+
+app.post('/api/v1/downloads/:id/cancel', requireAdmin, (req, res) => {
+  const job = db.prepare('SELECT * FROM download_jobs WHERE id = ?').get(req.params.id);
+  if (!job) return sendError(res, 'not_found', 'Job not found', 404);
+  if (job.status === 'completed' || job.status === 'failed' || job.status === 'cancelled') {
+    return res.json(job);
+  }
+  cancelJob(job.id);
+  res.json({ id: job.id, status: 'cancelled' });
 });
 
 // VM groups

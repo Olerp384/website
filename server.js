@@ -42,12 +42,12 @@ const makeStoredName = (original) => {
 const fetchRemoteFile = async (url) => {
   const maxSize = 50 * 1024 * 1024;
   const response = await fetch(url);
-  if (!response.ok) throw new Error('Не удалось скачать файл по ссылке');
+  if (!response.ok) throw new Error('Failed to download file from URL');
   const contentLength = response.headers.get('content-length');
-  if (contentLength && Number(contentLength) > maxSize) throw new Error('Файл слишком большой');
+  if (contentLength && Number(contentLength) > maxSize) throw new Error('Remote file too large');
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
-  if (buffer.length > maxSize) throw new Error('Файл слишком большой');
+  if (buffer.length > maxSize) throw new Error('Remote file too large');
   const contentType = response.headers.get('content-type') || 'application/octet-stream';
   let originalName = 'download.bin';
   try {
